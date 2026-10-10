@@ -1,10 +1,13 @@
 #Taken from: https://github.com/tfernd/HyperTile/
 
 import math
+from typing_extensions import override
 from einops import rearrange
-import random
+# Use torch rng for consistency across generations
+from torch import randint
+from comfy_api.latest import ComfyExtension, io
 
-def random_divisor(value: int, min_value: int, /, max_options: int = 1, counter = 0) -> int:
+def random_divisor(value: int, min_value: int, /, max_options: int = 1) -> int:
     min_value = min(min_value, value)
 
     # All big divisors of value (inclusive)
@@ -12,62 +15,66 @@ def random_divisor(value: int, min_value: int, /, max_options: int = 1, counter 
 
     ns = [value // i for i in divisors[:max_options]]  # has at least 1 element
 
-    random.seed(counter)
-    idx = random.randint(0, len(ns) - 1)
+    if len(ns) - 1 > 0:
+        idx = randint(low=0, high=len(ns) - 1, size=(1,)).item()
+    else:
+        idx = 0
 
     return ns[idx]
 
-class HyperTile:
+class HyperTile(io.ComfyNode):
     @classmethod
-    def INPUT_TYPES(s):
-        return {"required": { "model": ("MODEL",),
-                             "tile_size": ("INT", {"default": 256, "min": 1, "max": 2048}),
-                             "swap_size": ("INT", {"default": 2, "min": 1, "max": 128}),
-                             "max_depth": ("INT", {"default": 0, "min": 0, "max": 10}),
-                             "scale_depth": ("BOOLEAN", {"default": False}),
-                              }}
-    RETURN_TYPES = ("MODEL",)
-    FUNCTION = "patch"
+    def define_schema(cls):
+        return io.Schema(
+            node_id="HyperTile",
+            category="model/patch/unet",
+            inputs=[
+                io.Model.Input("model"),
+                io.Int.Input("tile_size", default=256, min=1, max=2048, advanced=True),
+                io.Int.Input("swap_size", default=2, min=1, max=128, advanced=True),
+                io.Int.Input("max_depth", default=0, min=0, max=10, advanced=True),
+                io.Boolean.Input("scale_depth", default=False, advanced=True),
+            ],
+            outputs=[
+                io.Model.Output(),
+            ],
+        )
 
-    CATEGORY = "_for_testing"
-
-    def patch(self, model, tile_size, swap_size, max_depth, scale_depth):
-        model_channels = model.model.model_config.unet_config["model_channels"]
-
-        apply_to = set()
-        temp = model_channels
-        for x in range(max_depth + 1):
-            apply_to.add(temp)
-            temp *= 2
-
+    @classmethod
+    def execute(cls, model, tile_size, swap_size, max_depth, scale_depth) -> io.NodeOutput:
         latent_tile_size = max(32, tile_size) // 8
-        self.temp = None
-        self.counter = 1
+        temp = None
 
         def hypertile_in(q, k, v, extra_options):
-            if q.shape[-1] in apply_to:
+            nonlocal temp
+            model_chans = q.shape[-2]
+            orig_shape = extra_options['original_shape']
+            apply_to = []
+            for i in range(max_depth + 1):
+                apply_to.append((orig_shape[-2] / (2 ** i)) * (orig_shape[-1] / (2 ** i)))
+
+            if model_chans in apply_to:
                 shape = extra_options["original_shape"]
                 aspect_ratio = shape[-1] / shape[-2]
 
                 hw = q.size(1)
                 h, w = round(math.sqrt(hw * aspect_ratio)), round(math.sqrt(hw / aspect_ratio))
 
-                factor = 2**((q.shape[-1] // model_channels) - 1) if scale_depth else 1
-                nh = random_divisor(h, latent_tile_size * factor, swap_size, self.counter)
-                self.counter += 1
-                nw = random_divisor(w, latent_tile_size * factor, swap_size, self.counter)
-                self.counter += 1
+                factor = (2 ** apply_to.index(model_chans)) if scale_depth else 1
+                nh = random_divisor(h, latent_tile_size * factor, swap_size)
+                nw = random_divisor(w, latent_tile_size * factor, swap_size)
 
                 if nh * nw > 1:
                     q = rearrange(q, "b (nh h nw w) c -> (b nh nw) (h w) c", h=h // nh, w=w // nw, nh=nh, nw=nw)
-                    self.temp = (nh, nw, h, w)
+                    temp = (nh, nw, h, w)
                 return q, k, v
 
             return q, k, v
         def hypertile_out(out, extra_options):
-            if self.temp is not None:
-                nh, nw, h, w = self.temp
-                self.temp = None
+            nonlocal temp
+            if temp is not None:
+                nh, nw, h, w = temp
+                temp = None
                 out = rearrange(out, "(b nh nw) hw c -> b nh nw hw c", nh=nh, nw=nw)
                 out = rearrange(out, "b nh nw (h w) c -> b (nh h nw w) c", h=h // nh, w=w // nw)
             return out
@@ -78,6 +85,14 @@ class HyperTile:
         m.set_model_attn1_output_patch(hypertile_out)
         return (m, )
 
-NODE_CLASS_MAPPINGS = {
-    "HyperTile": HyperTile,
-}
+
+class HyperTileExtension(ComfyExtension):
+    @override
+    async def get_node_list(self) -> list[type[io.ComfyNode]]:
+        return [
+            HyperTile,
+        ]
+
+
+async def comfy_entrypoint() -> HyperTileExtension:
+    return HyperTileExtension()
